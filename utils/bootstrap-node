@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+# set -x
+export PS4='+ [${BASH_SOURCE[0]##*/}:${LINENO}${FUNCNAME[0]:+:${FUNCNAME[0]}}] '
+
+PROG=${0##*/}
+
+usage() {
+    cat <<EOF
+Usage: $PROG [--mkfs|--mkfs-only] { -p|--phase 1|2|3 }
+
+Bootstraps single node after local consul agent is started.
+
+The required parameter is one of the following:
+
+  --phase 1 - start Motr confd servers
+  --phase 2 - start Motr IO servers
+  --phase 3 - start S3 servers
+
+Options:
+  --mkfs-only   Do m0mkfs only (CAUTION: wipes Motr data).
+  --mkfs        Do m0mkfs (CAUTION: wipes Motr data) and start Motr servers.
+  --m0d         Skip m0mkfs, start Motr servers.
+  -h, --help    Show this help and exit.
+EOF
+}
+
+die() {
+    echo "[$HOSTNAME] $PROG: $*" >&2
+    exit 1
+}
+
+do_mkfs=
+phase=-
+
+TEMP=$(getopt --options hp: \
+              --longoptions help,mkfs,mkfs-only,m0d,phase: \
+              --name "$PROG" -- "$@" || true)
+
+(($? == 0)) || { usage >&2; exit 1; }
+
+eval set -- "$TEMP"
+while true; do
+    case "$1" in
+        -h|--help)           usage; exit ;;
+        --mkfs)              do_mkfs=mkfs; shift ;;
+        --mkfs-only)         do_mkfs=mkfs-only; shift ;;
+        -p|--phase)          phase=$2; shift 2 ;;
+        --)                  shift; break ;;
+        *)                   echo 'getopt: internal error...'; exit 1 ;;
+    esac
+done
+
+[[ $phase =~ ^phase[1-3]$ ]] ||
+    die "Invalid value of 'phase' argument: $phase"
+
+if [[ $do_mkfs ]] && [[ $phase == 'phase3' ]]; then
+    die '--mkfs conflicts with --phase3'
+fi
+
+# If motr-kernel.service is not installed, the script will fail
+# anyway, with or without this check.  The purpose of the check is to
+# provide proper error message.
+#
+# Without this check `sudo systemctl start hare-hax` fails with "Failed to
+# start hax.service: Unit not found" error message.  That error
+# message is misleading, because hax.service _is_ installed, it is
+# one of its dependencies - motr-kernel.service - which isn't.
+out_systemctl=$(systemctl list-unit-files motr-kernel.service)
+if ! grep -qE '^motr-kernel\.service\>' <<< "$out_systemctl"; then
+    cat >&2 <<EOF
+**********************************************************************
+SNAP!  You've stumbled on an insufficiently tested branch of code.
+
+bootstrap-node script believes that 'motr-kernel' is not installed.
+Sometimes this belief contradicts reality.
+
+Hare developers need your help.
+
+Please add a comment to
+https://github.com/Seagate/cortx-hare/issues/625
+with the following output:
+
+----------BEGIN OUTPUT----------
+HOSTNAME=$HOSTNAME
+
+\`systemctl list-unit-files motr-kernel.service\`:
+$out_systemctl
+----------END OUTPUT----------
+
+Thanks!  You're such a wonderful person. [But you got problems.]
+**********************************************************************
+EOF
+    die "'motr-kernel' systemd service is not installed"
+fi
+
+. update-consul-conf --dry-run  # import CONFD_IDs, IOS_IDs, id2fid()
+
+if [[ $do_mkfs ]] && [[ ! -e /etc/sysconfig/motr-kernel ]]; then
+    # Auto-start of `motr-kernel` systemd unit will cause kernel panic
+    # unless `MOTR_NODE_UUID` configuration option is provided.
+    echo "MOTR_NODE_UUID='$(uuidgen --time)'" |
+        sudo tee /etc/sysconfig/motr-kernel >/dev/null
+fi
+
+wait_active() {
+    local svc=$1
+    local timeout=$2  # seconds
+    local count=0
+
+    while ! systemctl --quiet is-active $svc; do
+        (($count < $timeout)) || die "Unable to start $svc service"
+        sleep 1
+        ((++count))
+    done
+}
+
+process_started() {
+    local fid=$1
+    if [[ $(get-process-state $fid) == M0_CONF_HA_PROCESS_STARTED ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# m0d sends 'active' to systemd before the startup is actually finished,
+# so we need to parse the output of m0d this way to make sure it is
+# really started.
+wait_m0d_started() {
+    local fid=$1
+    local timeout=$2  # seconds
+    local count=0
+
+    while ! process_started $fid; do
+        (($count < $timeout)) || die "Unable to start m0d@$fid service"
+        sleep 1
+        ((++count))
+    done
+}
+
+# Make sure hax is always started.
+sudo mkdir -p /var/motr/hax
+sudo systemctl start hare-hax
+wait_active hare-hax 5
+
+if [[ -n $CONFD_IDs && $phase == phase1 ]]; then
+    [[ -f /var/lib/hare/confd.xc ]] ||
+        die 'Cannot bootstrap server node without /var/lib/hare/confd.xc file'
+    sudo mkdir -p /etc/motr
+    sudo cp /var/lib/hare/confd.xc /etc/motr/
+fi
+
+case $phase in
+    phase1)
+       proc='m0d@'
+       IDs=$CONFD_IDs
+       ;;
+    phase2)
+       proc='m0d@'
+       IDs=$IOS_IDs
+       ;;
+    phase3)
+       proc='s3server@'
+       IDs=$S3_IDs
+       ;;
+    *)
+       die 'Impossible happened'
+       ;;
+esac
+
+# It's critical to check for the service state in Consul catalogue.
+# Otherwise, if synchronisation of service status between Consul
+# servers delays (for some reason), hax may get 'offline' state from
+# Consul for already started m0d process (spoiling its ha_link).
+wait_m0mkfs_done() {
+    local id=$1
+    local fid=$(id2fid $id)
+
+    touch /tmp/motr-mkfs-pass-$fid
+    # Give time for service check to reset m0mkfs' HA state
+    # (see utils/check-service also).
+    while [[ -f /tmp/motr-mkfs-pass-$fid ||
+             -f /tmp/motr-mkfs-fail-$fid ||
+             $(get-service-health $id) == 'passing' ]]; do
+        sleep 1
+    done
+    # Give hax a chance to get the warning/offline state from Consul
+    # and finish ha_link before m0d process is started.
+    sleep 2
+}
+
+for id in $IDs; do
+    fid=$(id2fid $id)
+    if [[ $do_mkfs ]]; then
+        sudo systemctl start motr-mkfs@$fid
+        wait_m0mkfs_done $id
+    fi
+
+    if [[ $do_mkfs != 'mkfs-only' ]]; then
+        sudo systemctl start $proc$fid
+        if [[ $proc == 'm0d@' ]]; then
+            wait_m0d_started $fid 120
+        fi
+    fi
+done

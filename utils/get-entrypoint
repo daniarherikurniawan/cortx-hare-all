@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+
+#
+# Get entrypoint data from Consul.
+# See rfc/1/README.md for more details.
+#
+# Example:
+#
+#   $ ./get-entrypoint
+#   principal-RM: node1
+#   confds:
+#     - node: node1
+#       fid: 0x7200000000000001:0x0002
+#       address: 192.168.180.162@tcp:12345:44:101
+#     - node: node2
+#       fid: 0x7200000000000001:0x0005
+#       address: 192.168.180.166@tcp:12345:44:101
+
+SID=$(consul kv get -detailed leader | awk '/Session/ {print $2}')
+
+echo -n 'principal-RM: '
+curl -sX GET http://localhost:8500/v1/session/info/$SID | jq -r '.[] | .Node'
+
+echo 'confds:'
+curl -sX GET http://localhost:8500/v1/catalog/service/confd |
+    jq -r '.[] | "  - node: \(.Node)
+    fid: \(.ServiceID)
+    address: \(.Address)\(.ServiceAddress):\(.ServicePort)"'

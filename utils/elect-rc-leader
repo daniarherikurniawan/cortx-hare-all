@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+
+#
+# This is the handler for RC Leader election.
+#
+# It creates the session with confd health check and
+# tries to acquire the leader lock with this session.
+#
+# Use it like this:
+#
+# $ consul watch -type=key -key leader elect-rc-leader
+#
+
+sudo mkdir -p /var/log/hare
+
+# Redirect all printouts to the log file with the timestamp prefix:
+exec &>> /var/log/hare/consul-${0##*/}.log
+exec &> >(stdbuf -oL gawk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0 }')
+
+export SRC_DIR="$(dirname $(readlink -f $0))"
+
+get_session_id() {
+    consul kv get -detailed leader | awk '/Session/ {print $2}'
+}
+
+get_leader_node() {
+    curl -sX GET http://localhost:8500/v1/session/info/$(get_session_id) |
+        jq -r '.[] | .Node'
+}
+
+cleanup() {
+    # Nicely stop currently running RC handler (if any):
+    pkill -9 -f 'consul watch.*prefix eq' || true
+    # Nicely stop currently running RC handler (if any):
+    pkill -f 'sh.*proto-rc' || true
+}
+
+# If the session is already set - the leader is elected, so
+# there is nothing to do (except cleanup after ourself).
+get_session_id | grep -q ^- || {
+    if [[ $(get_leader_node) != $(node-name) ]]; then
+        cleanup
+    fi
+    exit 0
+}
+
+cleanup
+
+# Create session with the service:confd Health Checker:
+create_session() {
+    local checks_a=($(consul kv get -recurse m0conf/nodes/$(node-name) |
+                      egrep -w 'confd|ha' |
+                      sed -r 's/.*processes.([0-9]+).*/"service:\1"/'))
+    # Join array items into a comma-separated string.
+    local checks=$(IFS=,; echo "[\"serfHealth\", ${checks_a[*]}]")
+    local payld="{\"Name\": \"leader\", \"Checks\": $checks, \"LockDelay\": \"2s\"}"
+    local res=$(curl -sX PUT -d "$payld" http://localhost:8500/v1/session/create)
+    local sid=$(echo "$res" | jq -r '.ID' 2>/dev/null || true)
+
+    [[ $sid ]] || {
+        echo "Session creation failed: $res" >&2
+        return 1
+    }
+
+    echo $sid
+}
+
+destroy_session() {
+    local sid=$1
+    curl -sX PUT http://localhost:8500/v1/session/destroy/$sid &>/dev/null ||
+        true
+}
+
+# Try to acquire the lock unless it's already acquired by someone else:
+while true; do
+    get_session_id | grep -q ^- || exit 0
+    sleep $((RANDOM % 10))
+    SID=$(create_session || true)
+    if [[ $SID ]]; then
+        consul kv put -acquire -session=$SID leader $(node-name) \
+                      2>/dev/null && break
+        destroy_session $SID
+    fi
+done
+
+# We've got the lock! Start the leader in background:
+export SID
+(
+    # Destroy the session when leader dies:
+    trap "curl -sX PUT http://localhost:8500/v1/session/destroy/$SID &>/dev/null" EXIT
+
+    # XXX: notify Motr about new Principal RM here
+
+    # Start EQ watch:
+    consul watch -type=keyprefix -prefix eq/ $SRC_DIR/proto-rc
+) &

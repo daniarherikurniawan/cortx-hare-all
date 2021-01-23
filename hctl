@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -e -o pipefail
+# set -x
+export PS4='+ [${BASH_SOURCE[0]##*/}:${LINENO}${FUNCNAME[0]:+:${FUNCNAME[0]}}] '
+
+### Main entry point to all Hare features
+
+# constants
+PROG=${0##*/}
+SRC_DIR="$(dirname $(readlink -f $0))"
+M0_SRC_DIR=${M0_SRC_DIR:-${SRC_DIR%/*}/motr}
+
+# Quick fix for EOS-10650
+CORTX_HA_BIN=/opt/seagate/cortx/ha/bin/
+CORTX_HA_PY_INCLUDES=/opt/seagate/cortx/ha/lib64/python3.6/site-packages:/opt/seagate/cortx/ha/lib/python3.6/site-packages
+
+die() {
+    local LightRed="$(tput bold ; tput setaf 1)"
+    local NC="$(tput sgr0)" # No Color
+    local error='[ERROR]'
+
+    if [[ -t 2 ]] ; then
+        error="$LightRed$error$NC"
+    fi
+
+    echo -e "$PROG $error $@" >&2
+    exit 1
+}
+
+if [[ $SRC_DIR =~ bin/?$ ]]; then
+    HARE_BASE_DIR=$SRC_DIR/..
+else
+    # TODO: '/opt/seagate/cortx/hare' prefix can be different, e.g. '/usr'
+    HARE_BASE_DIR=/opt/seagate/cortx/hare
+    [[ -d $HARE_BASE_DIR && -e $HARE_BASE_DIR/bin/hctl ]] ||
+        die 'Hare is not installed, please run `make devinstall`.'
+fi
+
+usage() {
+    # NB: `local var=$(func)` expression ignores exit status of `func`
+    # and always succeeds.
+    local commands  # do not assign the value here
+    commands=$(commands_usage)
+    cat <<EOF
+Usage: $PROG <command> [options]
+
+Interact with Motr cluster.
+
+Commands:
+
+$commands
+
+    help        Show this help and exit.
+EOF
+}
+
+command_help() (
+    local exec=$1
+    local tag='# :help: '
+
+    # Note, that these `die` statements don't terminate the script.
+    case $(grep -c "^$tag" $exec) in
+        0) die "$exec: '$tag' line is missing" ;;
+        1) grep -Po "(?<=^$tag).*" $exec ;;
+        *) die "$exec: there can be only one '$tag' line" ;;
+    esac
+)
+
+commands_usage() {
+    local -a lines
+    local name help line
+    local ok=true
+    for exec in $HARE_BASE_DIR/libexec/hare-*; do
+        name=${exec##*/hare-}
+        help=$(command_help $exec) || ok=false
+        lines+=("$(echo -e "    $name\t$help")")
+    done
+    $ok || return 1
+
+    for line in "${lines[@]}"; do
+        echo "$line"  # quotes are needed
+    done
+}
+
+# parse CLI options
+while true ; do
+    case $1 in
+        -h|--help|help) usage; exit ;;
+        -*) die "Unknown option '$1'; see \`$PROG help\`" ;;
+        *)  cmd=${1:-help} ; shift || true ; break ;;
+    esac
+    shift
+done
+
+# process commands
+case $cmd in
+    help) usage; exit ;;
+    bootstrap|start|reportbug|shutdown|status|drive-state|node-join)
+        if [[ -d $M0_SRC_DIR/utils ]]; then
+            PATH="$M0_SRC_DIR/utils:$PATH"
+        fi
+        PATH="$HARE_BASE_DIR/libexec:$PATH"
+        PATH="$HARE_BASE_DIR/bin:$PATH"
+        export PATH
+
+        # TODO: python3.6 version can be different
+        PYTHONPATH="$HARE_BASE_DIR/lib/python3.6/site-packages"
+        PYTHONPATH="$HARE_BASE_DIR/lib64/python3.6/site-packages:$PYTHONPATH"
+        export PYTHONPATH
+
+        systemd-cat --identifier $PROG <<< "$PROG $cmd $@"
+        exec $HARE_BASE_DIR/libexec/hare-$cmd "$@"
+        ;;
+    node)
+        # This is a temporary solution. Will be removed by the results of https://github.com/Seagate/cortx-hare/pull/1160
+        # After that the whole case block is TO BE REMOVED
+        if [[ -d $M0_SRC_DIR/utils ]]; then
+            PATH="$M0_SRC_DIR/utils:$PATH"
+        fi
+        PATH="$CORTX_HA_BIN:$PATH"
+        PATH="$HARE_BASE_DIR/libexec:$PATH"
+        PATH="$HARE_BASE_DIR/bin:$PATH"
+        export PATH
+
+        # TODO: python3.6 version can be different
+        PYTHONPATH="$HARE_BASE_DIR/lib/python3.6/site-packages"
+        PYTHONPATH="$HARE_BASE_DIR/lib64/python3.6/site-packages:$PYTHONPATH"
+        PYTHONPATH="$PYTHONPATH:$CORTX_HA_PY_INCLUDES"
+        export PYTHONPATH
+
+        systemd-cat --identifier $PROG <<< "$PROG $cmd $@"
+        exec $HARE_BASE_DIR/libexec/hare-$cmd "$@"
+        ;;
+    *) die "Unknown command: '$cmd'" ;;
+esac

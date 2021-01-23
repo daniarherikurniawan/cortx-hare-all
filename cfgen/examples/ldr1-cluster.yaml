@@ -1,0 +1,43 @@
+# Cluster Description File (CDF).
+# See `cfgen --help-schema` for the format description.
+
+nodes:
+  - hostname: pod-c1        # [user@]hostname
+    data_iface: eth1_c1     # name of data network interface
+    data_iface_type: o2ib   # LNet type of network interface (optional);
+                            # supported values: "tcp" (default), "o2ib"
+    m0_servers:
+      - runs_confd: true
+        io_disks:
+          data: []
+      - io_disks:
+          data:
+            - /dev/sdd
+            - /dev/sde
+            - /dev/sdf
+            - /dev/sdg
+    m0_clients:
+        s3: 0           # number of S3 servers to start
+        other: 2        # max quantity of other Motr clients this node may have
+  - hostname: pod-c2
+    data_iface: eth1_c2
+    data_iface_type: o2ib
+    m0_servers:
+      - runs_confd: true
+        io_disks:
+          data: []
+      - io_disks:
+          data:
+            - /dev/sdh
+            - /dev/sdi
+            - /dev/sdj
+            - /dev/sdk
+    m0_clients:
+        s3: 0
+        other: 2
+pools:
+  - name: the pool
+    #type: sns  # optional; supported values: "sns" (default), "dix", "md"
+    data_units: 1
+    parity_units: 0
+    #allowed_failures: { site: 0, rack: 0, encl: 0, ctrl: 0, disk: 0 }

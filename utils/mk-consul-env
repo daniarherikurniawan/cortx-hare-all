@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+# set -x
+export PS4='+ [${BASH_SOURCE[0]##*/}:${LINENO}${FUNCNAME[0]:+:${FUNCNAME[0]}}] '
+
+PROG=${BASH_SOURCE[0]##*/}
+
+# XXX '/opt/seagate/cortx/hare' prefix can be different
+HARE_DIR=/opt/seagate/cortx/hare
+
+ENV_TEMPLATE=$HARE_DIR/share/consul/consul-env.in
+ENV_FILE=/var/lib/hare/consul-env
+
+usage() {
+    cat <<EOF
+Usage: $PROG OPTION...
+
+Create $ENV_FILE with Consul agent startup parameters.
+
+Options:
+  -m, --mode MODE           MODE is either 'server' or 'client'.
+  -b, --bind IP             IP address to bind to.
+  -j, --join IP             IP address to join.
+  -e, --extra-options STR   Additional options.
+  -h, --help                Show this help and exit.
+EOF
+}
+
+mode=
+bind_addr=
+join_addr=
+extra_opts=
+
+TEMP=$(getopt --options hm:b:j:e: \
+              --longoptions help,mode:,bind:,join:,extra-options: \
+              --name "$PROG" -- "$@" || true)
+
+(($? == 0)) || { usage >&2; exit 1; }
+
+eval set -- "$TEMP"
+while true; do
+    case "$1" in
+        -h|--help)           usage; exit ;;
+        -m|--mode)           mode=$2; shift 2 ;;
+        -b|--bind)           bind_addr=$2; shift 2 ;;
+        -j|--join)           join_addr=$2; shift 2 ;;
+        -e|--extra-options)  extra_opts=$2; shift 2 ;;
+        --)                  shift; break ;;
+        *)                   echo 'getopt: internal error...'; exit 1 ;;
+    esac
+done
+
+[[ -n $mode && -n $bind_addr ]] || {
+    usage >&2
+    exit 1
+}
+
+sed -r -e "s/^(NODE=).*/\1$(node-name)/" \
+       -e "s/^(NODE_ID=).*/\1$($HARE_DIR/libexec/gen-uuid $(node-name))/" \
+       -e "s/^(MODE=).*/\1$mode/" \
+       -e "s/^(BIND=).*/\1$bind_addr/" \
+       -e "s/^(CLIENT)=.*/\1=127.0.0.1 $bind_addr/" $ENV_TEMPLATE |
+    sudo tee $ENV_FILE >/dev/null
+
+if [[ -n $join_addr ]]; then
+    sudo sed -r -e "s/^(JOIN=).*/\1${join_addr:+-retry-join $join_addr}/" \
+             -i $ENV_FILE
+fi
+
+if [[ -n $extra_opts ]]; then
+    sudo sed -r "s/^(EXTRA_OPTS=).*/\1$extra_opts/" -i $ENV_FILE
+fi
+
+# Prepare for consul-agent startup:
+sudo rm -rf /var/lib/hare/consul-data-$bind_addr
+
+conf_dir=consul-$mode-conf
+sudo mkdir -p /var/lib/hare/$conf_dir
+sudo cp $HARE_DIR/share/consul/$conf_dir.json.in \
+     /var/lib/hare/$conf_dir/$conf_dir.json

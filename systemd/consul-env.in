@@ -1,0 +1,9 @@
+# mandatory:
+NODE=
+NODE_ID=
+MODE=server
+BIND={{GetPrivateIP}}
+CLIENT=127.0.0.1 {{GetPrivateIP}}
+# optional:
+JOIN=
+EXTRA_OPTS=

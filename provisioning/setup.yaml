@@ -1,0 +1,19 @@
+hare:
+  post_install:
+    script: /opt/seagate/cortx/hare/conf/setup.py
+    args: --report-unavailable-features
+  init:
+    script: null
+    args: null
+  config:
+    script: null
+    args: null
+  test:
+    script: null
+    args: null
+  reset:
+    script: null
+    args: null
+
+support_bundle:
+    - /opt/seagate/cortx/hare/bin/hctl reportbug

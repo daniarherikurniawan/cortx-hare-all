@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+
+prog=${0##*/}
+
+usage() {
+    cat <<EOF
+Usage: $prog OPTION...
+
+Checks health of the specified service (hax or Motr).
+
+Options:
+  -x, --hax       Check hax service.
+  -f, --fid fid   Check Motr service of the specified fid.
+  -s, --svc svc   Check another service specified as svc.
+  -h, --help      Show this help.
+EOF
+}
+
+fid=
+hax=
+svc=
+
+TEMP=$(getopt --options hxf:s: \
+              --longoptions help,hax,fid:,svc: \
+              --name "$prog" -- "$@" || true)
+
+(($? == 0)) || { usage >&2; exit 1; }
+
+eval set -- "$TEMP"
+
+while true ; do
+    case "$1" in
+        -h|--help)   usage; exit ;;
+        -x|--hax)    hax=yes; shift 1 ;;
+        -f|--fid)    fid=$2; shift 2 ;;
+        -s|--svc)    svc=$2; shift 2 ;;
+        --)          shift; break ;;
+        *)           echo 'getopt: internal error...'; exit 1 ;;
+    esac
+done
+
+[[ -n $fid || -n $hax || -n $svc ]] || { usage >&2; exit 1; }
+
+if [[ $hax ]]; then
+    service=hare-hax
+elif [[ $fid ]]; then
+    service=m0d@$fid
+else
+    service=$svc
+fi
+
+# See https://www.consul.io/docs/agent/checks#check-scripts
+declare -A status=(
+    [passing]=0
+    [warning]=1
+    [failing]=2
+)
+
+# Convert fid to decimal service id (used in Consul):
+# $ fid=0x7200000000000001:0xa
+# $ echo $((16#${fid/*:0x/}))
+# 10
+fid2id() {
+    local fid=$1
+    echo $((16#${fid/*:0x/}))
+}
+
+# During bootstrap with m0mkfs we need to report passing and
+# warning (offline) status for m0mkfs process to make sure
+# its ha_link is destroyed before m0d process is started.
+if [[ $service =~ m0d ]]; then
+    pass=/tmp/motr-mkfs-pass-$fid
+    fail=/tmp/motr-mkfs-fail-$fid
+
+    if [[ -f $pass ]]; then
+        rm $pass
+        touch $fail
+        exit ${status[passing]}
+    elif [[ -f $fail ]]; then
+        id=$(fid2id $fid)
+        if [[ $(get-service-health $id) != 'passing' ]]; then
+            # The passing/online state is still not synchronized among
+            # Consul servers, don't change it just yet...
+            exit ${status[passing]}
+        fi
+        rm $fail
+        exit ${status[warning]}
+    fi
+fi
+
+case $(systemctl is-active $service) in
+    active|deactivating)
+        exit ${status[passing]};;
+    failed)
+        exit ${status[failing]};;
+    *)
+        exit ${status[warning]};;
+esac

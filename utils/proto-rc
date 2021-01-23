@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2020 Seagate Technology LLC and/or its Affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# For any questions about this software or licensing,
+# please email opensource@seagate.com or cortx-questions@seagate.com.
+
+set -eu -o pipefail
+export PS4='+ [${BASH_SOURCE[0]##*/}:${LINENO}${FUNCNAME[0]:+:${FUNCNAME[0]}}] '
+# set -x
+
+# Recovery Coordinator (RC) prototype.
+#
+# Implemented as a Consul watch handler over the Events Queue (EQ)
+# in the persistent KV store.
+#
+# Takes JSON array of events from stdin and processes them one after another.
+# Each event is deleted from the queue after processing.
+#
+# NOTE: depends on jq >= 1.6 - https://stedolan.github.io/jq
+#
+# Run it like this:
+#
+#   $ consul watch -type=keyprefix -prefix eq/ proto-rc
+#
+
+# Redirect all printouts to the log file with the timestamp prefix:
+LOGFILE="/var/log/hare/consul-${0##*/}.log"
+exec &>> ${LOGFILE}
+exec &> >(stdbuf --output=L gawk '{ print strftime("%Y-%m-%d %H:%M:%S"), $0 }')
+
+CURR_DIR="$(dirname $(readlink -f $0))"
+RULES_DIR=${CURR_DIR%/*}/rules
+RULES_DEFAULT_TIMEOUT_SEC=4
+RULES_CRITICAL_TIMEOUT_SEC=6
+
+STOP=0
+sig_handler() {
+    echo 'Signal caught! Exiting...'
+    STOP=1
+}
+
+check4signal() {
+    if (( STOP == 1 )); then
+        exit 1
+    fi
+}
+
+# Simple log helper to output to stderr and syslog
+log() {
+    logger --tag "hare/${0##*/}" --stderr "$*"
+}
+
+# Users can use this function to set timeouts.
+set_timeout() {
+    local after=$1 # seconds
+    local event=$2
+    local tmo=$(date -d @$(($(date '+%s') + $after)) '+%Y%m%d%H%M%S')
+    local event_s=$(consul kv get timeout/$tmo 2>/dev/null || true)
+    if [[ $event_s ]]; then
+        event="$event_s,$event"
+    fi
+    consul kv put timeout/$tmo $event
+}
+
+# Wrapper to call given script with timeout util. See 'man 1 timeout'
+exec_with_timeout() {
+    local script=$1
+    local timeout=${2:-$RULES_DEFAULT_TIMEOUT_SEC}
+    local rc=0
+    timeout --kill-after $RULES_CRITICAL_TIMEOUT_SEC $timeout $script || rc=$?
+    # 124 - timed out code returned by timeout utility. See 'man 1 timeout'
+    if (( $rc == 124 )); then
+        log "Script $script timed out ($rc). See $LOGFILE"
+    elif (( $rc != 0 )); then
+        log "Script $script failed with code $rc. See $LOGFILE"
+    fi
+}
+
+# Process events:
+#
+#   Example of incoming JSON:
+#
+#     [{"Key":"eq/3","CreateIndex":1618,"ModifyIndex":1618,"LockIndex":0,"Flags":0,"Value":"eyJtZXNzYWdlX3R5cGUiOiAiZGVidWdfUkMiLCAicGF5bG9hZCI6ICJQQVlMT0FEIn0=","Session":""}]
+#
+#   Where Value is base64-encoded JSON
+#
+#   When there are no changes, Consul sends us 'null' string, which
+#   confuses `jq '.[]'`:
+#
+#     jq: error (at <stdin>:1): Cannot iterate over null (null)
+#
+#   So 'null' strings are filtered out with `sed`.
+sed '/^null$/d' | jq --compact-output '.[]' | {
+    trap sig_handler TERM
+
+    while read EQ_ITEM; do
+        EPOCH=$(jq --raw-output '.Key' <<<"$EQ_ITEM")
+        EVENT=$(jq --raw-output '.Value | @base64d' <<<"$EQ_ITEM")
+        log "$CONSUL_INDEX: Process epoch: $EPOCH: $EVENT"
+
+        export HARE_RC_EVENT_TYPE=$(jq --raw-output '.message_type' <<<"$EVENT")
+        export HARE_RC_EVENT_PAYLOAD=$(jq --raw-output '.payload' <<<"$EVENT")
+        log "HARE_RC_EVENT_TYPE: $HARE_RC_EVENT_TYPE, HARE_RC_EVENT_PAYLOAD: $HARE_RC_EVENT_PAYLOAD"
+
+        case $HARE_RC_EVENT_TYPE in
+          # wake_RC and tmo* are examples of legacy functionality the relevance
+          # of which can be reconsidered and removed if needed.
+          wake_RC)
+            log "${0} is woken up"
+            ;;
+          tmo*)
+            set_timeout $HARE_RC_EVENT_PAYLOAD "tmo$CONSUL_INDEX"
+            ;;
+          # Example when type does not correspond to rule script. Not
+          # recommended for use.
+          debug_RC)
+            exec_with_timeout $RULES_DIR/_debug
+            ;;
+          # Run rule script with the name equal to incoming event type.
+          # Recommended option for new rule scripts and event types.
+          *)
+            if [[ -x $RULES_DIR/$HARE_RC_EVENT_TYPE \
+               && -f $RULES_DIR/$HARE_RC_EVENT_TYPE ]]; then
+                exec_with_timeout $RULES_DIR/$HARE_RC_EVENT_TYPE
+            else
+                exec_with_timeout $RULES_DIR/_default
+            fi
+            ;;
+        esac
+
+        consul kv delete $EPOCH
+        check4signal
+    done
+}
+
+scheduled_wake_pid() {
+    grep 'TAG=wake_RC' /proc/*/environ 2>/dev/null | cut -d/ -f3
+}
+
+wake_rc() {
+    h0q eq 'wake_RC' 'null' &>/dev/null
+}
+
+wake_me_after() {
+    local after=$1 # secs
+    kill $(scheduled_wake_pid) &>/dev/null || true
+    ( TAG=wake_RC sleep $after_s && wake_rc ) &>/dev/null &
+}
+
+schedule_timeout() {
+    local tmo=${1#*/} # [timeout/]YYYYmmddHHMMSS
+    local tmo_f tmo_s now_s after_s
+    unset IFS # otherwise tmo_f might be invalid
+    # Convert 'YYYYmmddHHMMSS' to 'YYYY-mm-dd HH:MM:SS'.
+    tmo_f=$(sed -r 's/(....)(..)(..)(..)(..)(..)/\1-\2-\3 \4:\5:\6/' <<< $tmo)
+    tmo_s=$(date -d "$tmo_f" '+%s')
+    now_s=$(date -d 'now' '+%s')
+    after_s=$((tmo_s - now_s))
+    (( after_s > 0 )) || wake_rc
+    wake_me_after $after_s
+}
+
+# Process timeouts (if any):
+IFS=':'
+consul kv get -recurse timeout | {
+    trap sig_handler TERM
+    while read TMO EVENT; do
+        tmo=${TMO#*/}
+        now=$(date +%Y%m%d%H%M%S)
+        if (( tmo > now )); then
+            schedule_timeout $tmo
+            exit 0
+        fi
+        consul kv delete $TMO
+        check4signal
+    done
+}

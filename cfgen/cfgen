@@ -1,0 +1,1755 @@
+#!/usr/bin/env python3
+
+import abc
+import argparse
+import ast
+from enum import Enum, auto
+from functools import lru_cache
+import itertools
+import json
+import os
+from pprint import pprint
+import random
+import re
+import socket
+import subprocess
+import sys
+from typing import Any, Callable, Dict, Iterator, List, NamedTuple, Optional, \
+    Set, Tuple
+import yaml
+
+
+__version__ = '0.14'
+
+
+def parse_opts(argv):
+    p = argparse.ArgumentParser(description='Generate configuration files'
+                                ' required to start Motr cluster.',
+                                usage='%(prog)s [OPTION]... CDF')
+    p.add_argument('CDF', type=argparse.FileType(),
+                   help='cluster description file;'
+                   " use '--help-schema' option for format description")
+    p.add_argument('--help-schema', nargs=0,
+                   help='show the schema of cluster description file (CDF)',
+                   action=ShowSchema)
+    default_dhall_dir = '/opt/seagate/cortx/hare/share/cfgen/dhall'
+    p.add_argument('-D', '--dhall', metavar='dir',
+                   help='directory with auxiliary Dhall expressions'
+                   f' (defaults to {default_dhall_dir!r})',
+                   dest='dhall_dir', default=default_dhall_dir)
+    p.add_argument('-o', metavar='output-dir',
+                   help="output directory (defaults to '.')",
+                   dest='output_dir', default='.')
+    p.add_argument('--mock', help='Generate pseudo-random "facts". The hosts'
+                   ' specified in the cluster description file will not be'
+                   " visited and don't even have to exist.",
+                   action='store_true')
+    p.add_argument('--debug',
+                   help='print the enriched cluster description and exit',
+                   action='store_true')
+    p.add_argument('-V', '--version', action='version',
+                   version='%(prog)s ' + __version__)
+    opts = p.parse_args(argv)
+
+    # Sanity check.
+    dirs = [('--dhall', opts.dhall_dir, os.R_OK)]
+    if not opts.debug:
+        dirs.append(('-o', opts.output_dir, os.W_OK))
+    for opt, d, perm in dirs:
+        if not (d and os.path.isdir(d) and os.access(d, os.X_OK | perm)):
+            what = 'read' if perm == os.R_OK else 'writ'
+            die(f'{opt!r} argument must be a path to {what}able directory')
+
+    opts.dhall_dir = os.path.abspath(opts.dhall_dir)
+    return opts
+
+
+class ShowSchema(argparse.Action):
+    def __call__(self, *args):
+        # XXX-TODO: Rename `nodes.hostname` to `nodes.name`.
+        print("""\
+# Cluster Description is a YAML file with the following schema:
+---  # start of the document (optional)
+nodes:
+  - hostname: <str>    # [user@]hostname; e.g., localhost, pod-c1
+    data_iface: <str>  # name of network interface; e.g., eth1, eth1:c1
+    data_iface_type: tcp|o2ib  # type of network interface;
+                               # optional, defaults to "tcp"
+    m0_servers:        # optional for client-only nodes
+      - runs_confd: <bool>  # optional, defaults to false
+        io_disks:
+          meta_data: <str>  # device path for meta-data;
+                            # optional, Motr will use "/var/motr/m0d-<FID>/"
+                            # by default
+          data: [ <str> ]   # e.g. [ "/dev/loop0", "/dev/loop1", "/dev/loop2" ]
+                            # Empty list means no IO service.
+    m0_clients:
+        s3: <int>     # number of S3 servers to start
+        other: <int>  # max quantity of other Motr clients this host may have
+pools:
+  - name: <str>
+    type: sns|dix|md   # optional, defaults to "sns";
+                       # "sns" - data pool, "dix" - KV, "md" - meta-data pool.
+    disk_refs:  # optional section
+      - path: <str>  # io_disks.data value
+        node: <str>  # optional; 'hostname' of the corresponding node
+    data_units: <int>
+    parity_units: <int>
+    allowed_failures:  # optional section; no failures will be allowed
+                       # if this section is missing or all of its elements
+                       # are zeroes
+      site: <int>
+      rack: <int>
+      encl: <int>
+      ctrl: <int>
+      disk: <int>
+
+# Profile is a reference to pools.  When Motr client is started, it receives
+# profile fid from the command line.  Motr client can only use the pools
+# referred to by its profile.
+#
+profiles:  # This section is optional.  If it is missing, a single "default"
+           # profile referring to all pools will be created.
+  - name: <str>
+    pools: [ <str> ]
+...  # end of the document (optional)""")
+        sys.exit()
+
+
+def main(argv=None):
+    opts = parse_opts(argv)
+
+    check_dhall_versions()
+
+    cdf = opts.CDF.read()
+    opts.CDF.close()
+    validate_cdf_schema(cdf,
+                        cdf_path=opts.CDF.name,
+                        schema_path=os.path.join(
+                            opts.dhall_dir, 'types', 'ClusterDesc.dhall'))
+    cluster_desc = yaml.safe_load(cdf)
+
+    enrich_cluster_desc(cluster_desc, opts.mock)
+    validate_cluster_desc(cluster_desc)
+
+    if opts.debug:
+        pprint(cluster_desc)
+        return
+
+    cluster = build_cluster(cluster_desc)
+
+    outs: List[Tuple[str, Callable[..., str], List[Any]]] = [
+        ('consul-agents.json', generate_consul_agents, [cluster]),
+        ('consul-kv.json', generate_consul_kv, [cluster, opts.dhall_dir]),
+        ('confd.dhall', generate_confd, [cluster.m0conf, opts.dhall_dir])]
+    for path, generate, args in outs:
+        with open(os.path.join(opts.output_dir, path), 'w') as f:
+            f.write(generate(*args))
+
+
+def die(msg: str, status: int = 1):
+    assert msg
+    assert status != 0
+    print(os.path.basename(sys.argv[0]) + ': ' + msg, file=sys.stderr)
+    sys.exit(status)
+
+
+def all_unique(xs) -> bool:
+    """Returns True iff all entries of the sequence are unique.
+    """
+    if hasattr(xs, '__iter__') and hasattr(xs, '__next__'):
+        # `xs` is a generator.  We should not consume it twice.
+        xs = list(xs)
+    return len(xs) == len(set(xs))
+
+
+Version = NamedTuple('Version',
+                     [('major', int), ('minor', int), ('patch', int)])
+
+
+def version(s: str) -> Version:
+    # We could have used `packaging.version` module, but it's not
+    # worth to add an external dependency.
+    return Version(*map(int, s.split('.', 2)))
+
+
+def check_dhall_versions() -> None:
+    # See https://github.com/dhall-lang/dhall-haskell/releases
+    versions = {'dhall': version('1.26.1'), 'yaml-to-dhall': version('1.4.1')}
+
+    for exe, ver in versions.items():
+        try:
+            proc = subprocess.Popen([exe, '--version'], stdout=subprocess.PIPE)
+        except FileNotFoundError as err:
+            print(str(err), file=sys.stderr)
+            die(f'{exe} >= {ver} required, none found')
+
+        out = proc.communicate(timeout=15)[0]
+        if version(out.strip().decode()) < ver:
+            die(f'{exe} >= {ver} required')
+
+
+def validate_cdf_schema(cdf: str, cdf_path: str, schema_path: str) -> None:
+    assert os.path.isabs(schema_path)
+    proc = subprocess.Popen(['yaml-to-dhall', schema_path],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    err = proc.communicate(input=cdf.encode(), timeout=15)[1]
+    if proc.returncode != 0:
+        die(f'**ERROR** {cdf_path}: Invalid cluster description\n' +
+            err.decode().strip() +
+            f"\n\nTo learn more, run '{sys.argv[0]} --help-schema'.",
+            proc.returncode)
+
+
+def ipaddr_key(iface: str) -> str:
+    return 'ipaddress_' + iface
+
+
+def enrich_cluster_desc(desc: Dict[str, Any], mock_p: bool) -> None:
+    for node in desc['nodes']:
+        # The fact names used here correspond to version 2.4.1 of `facter`.
+        # See https://puppet.com/docs/puppet/6.6/core_facts.html#legacy-facts
+        node['facts'] = get_facts(node['hostname'], mock_p,
+                                  'processorcount', 'memorysize_mb',
+                                  ipaddr_key(node['data_iface']))
+        node['facts']['_memsize_MB'] = int(float(
+            node['facts']['memorysize_mb']))
+
+        if 'm0_servers' not in node:
+            continue
+
+        for m0d in node['m0_servers']:
+            m0d.setdefault('runs_confd', False)
+            m0d['_io_disks'] = get_disks(node['hostname'], mock_p,
+                                         m0d['io_disks']['data'])
+
+    if 'profiles' not in desc:
+        sns_pools = [pool['name'] for pool in desc['pools']
+                     if pool_type(pool) is PoolT.sns]
+        desc['profiles'] = [{'name': 'default', 'pools': sns_pools}]
+
+
+def validate_cluster_desc(desc: Dict[str, Any]) -> None:
+    validate_nodes_desc(desc['nodes'])
+    validate_pools_desc(desc['pools'])
+    if 'profiles' in desc:
+        validate_profiles_desc(desc['profiles'], desc['pools'])
+
+
+def validate_nodes_desc(nodes_desc: List[Dict[str, Any]]) -> None:
+    Node = NamedTuple('Node', [('name', str), ('ipaddr', str)])
+    nodes = [Node(name=x['hostname'],
+                  ipaddr=x['facts'][ipaddr_key(x['data_iface'])])
+             for x in nodes_desc]
+    assert all_unique(x.name for x in nodes), \
+        "Node names ('hostname' values in the CDF) are not unique:\n" + \
+        '\n'.join('  ' + x.name for x in nodes)
+    assert all_unique(x.ipaddr for x in nodes), \
+        'IP addresses are not unique:\n' + \
+        '\n'.join('  ' + x.ipaddr for x in nodes)
+
+    total_nr_confds = total_nr_disks = 0
+
+    for node in nodes_desc:
+        name = node['hostname']
+        assert name
+        iface = node['data_iface']
+        assert iface
+        assert node['facts'][ipaddr_key(iface)], \
+            f"""{name}: {iface!r} interface has no IP address
+Make sure the value of data_iface in the CDF is correct."""
+
+        if 'm0_servers' not in node:
+            assert (node['m0_clients']['s3']
+                    + node['m0_clients']['other'] > 0), \
+                f'{name}: At least one client should be configured'
+            continue
+
+        nr_confds = sum(1 for m0d in node['m0_servers'] if m0d['runs_confd'])
+        assert nr_confds < 2, f'{name}: Too many confd services'
+        total_nr_confds += nr_confds
+
+        for m0d in node['m0_servers']:
+            d = m0d['io_disks']
+            assert m0d['runs_confd'] or d['data'], \
+                f"{name}: Either 'runs_confd' or 'io_disks.data' must be set"
+            assert '' not in d['data'], \
+                f"{name}: Empty strings in 'io_disks.data' are not allowed"
+            if 'meta_data' in d:
+                assert d['meta_data'], \
+                    f"{name}: 'io_disks.meta_data' must not be an empty string"
+                assert d['meta_data'] not in d['data'], \
+                    f"{name}: Meta-data disk must not belong io_disks.data"
+
+        disks: List[Disk] = []
+        for m0d in node['m0_servers']:
+            disks.extend(m0d['_io_disks'])
+        assert all_unique(disks), \
+            f'{name}: The same disk is used by several IO services'
+        total_nr_disks += len(disks)
+
+        assert (nr_confds + node['m0_clients']['s3']
+                + node['m0_clients']['other'] > 0), \
+            f'{name}: At least one Motr server or client is required'
+
+    assert total_nr_confds > 0, 'At least one confd is required'
+    assert total_nr_disks > 0, 'No disks found'
+
+
+def validate_pools_desc(pools_desc: List[Dict[str, Any]]) -> None:
+    pool_names = [x['name'] for x in pools_desc]
+    assert all_unique(pool_names), \
+        'Pool names are not unique:\n' + \
+        '\n'.join('  ' + x for x in pool_names)
+    assert all(s for s in pool_names), 'Pool name must not be empty'
+
+    pool_types: Set[PoolT] = set()
+    for pool in pools_desc:
+        name = pool['name']
+        t = pool_type(pool)
+        if t is PoolT.sns:
+            d = pool.get('allowed_failures')
+            assert d is None or d['disk'] <= pool['parity_units'], """\
+{}: Cannot allow that many disk failures ({})
+The number of allowed disk failures must not exceed the number of spare disks\
+ (parity_units={}).""".format(name, d['disk'], pool['parity_units'])
+        else:
+            data_units = pool['data_units']
+            assert data_units == 1, f"""\
+{name}: Wrong number of data_units ({data_units})
+Pools of {t!r} type can only have 1 data unit."""
+            assert t not in pool_types, \
+                f'{name}: No more than one {t!r} pool can be defined'
+        pool_types.add(t)
+
+        if 'disk_refs' not in pool:
+            continue
+
+        # XXX Do we want to support disk_refs for DIX and MD pools as well?
+        assert t is PoolT.sns, \
+            f"{name}: disk_refs are only supported for pools of 'sns' type"
+        disk_refs = pool['disk_refs']
+        assert disk_refs, \
+            f'Pool {name!r}: disk_refs must not be empty' \
+            ' (it can be omitted though)'
+        assert all_unique(repr(x) for x in disk_refs), \
+            f'Pool {name!r}: disk_refs must be unique'
+
+    assert PoolT.sns in pool_types, \
+        "At least one pool of 'sns' type must be defined"
+
+    sns_pools = [pool for pool in pools_desc if pool_type(pool) is PoolT.sns]
+    unrestricted = [pool['name'] for pool in sns_pools
+                    if 'disk_refs' not in pool]
+    assert len(unrestricted) <= 1, """\
+These pools compete for disks: {}
+Leave only one of them or allot disks using disk_refs""".format(
+        ', '.join(unrestricted))
+    assert any('disk_refs' in pool for pool in sns_pools) == \
+        (not unrestricted), \
+        "'sns' pools with and without disk_refs cannot be used together"
+
+
+def validate_profiles_desc(profiles_desc: List[Dict[str, Any]],
+                           pools_desc: List[Dict[str, Any]]) -> None:
+    assert profiles_desc, \
+        'List of profiles must not be empty (it can be omitted though)'
+    assert all_unique(x['name'] for x in profiles_desc), \
+        'Profile names are not unique:\n' + \
+        '\n'.join('  ' + x['name'] for x in profiles_desc)
+    assert all(x['name'] for x in profiles_desc), \
+        'Profile name must not be empty'
+
+    Pool = NamedTuple('Pool', [('name', str), ('type', PoolT)])
+    all_pools = [Pool(pool['name'], pool_type(pool)) for pool in pools_desc]
+
+    for prof in profiles_desc:
+        name, pools = prof['name'], prof['pools']
+        assert pools, f"Profile {name!r} doesn't refer to any pools"
+        for case, select in [
+                ('unknown', lambda _: True),
+                ('non-sns', lambda t: t is PoolT.sns)]:
+            bad = [s for s in pools
+                   if s not in [pool.name for pool in all_pools
+                                if select(pool.type)]]
+            assert not bad, \
+                'Profile {!r} refers to {} pool{}: {}'.format(
+                    name,
+                    case,
+                    's' if len(bad) > 1 else '',
+                    ', '.join(bad))
+        assert all_unique(pools), \
+            f'Profile {name!r} has non-unique pool references'
+
+
+@lru_cache(maxsize=1)
+def minion_id() -> Optional[str]:
+    path = '/etc/salt/minion_id'
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return f.readline().strip()
+
+
+def is_localhost(hostname: str) -> bool:
+    assert hostname
+    return hostname in ('localhost', '127.0.0.1', minion_id(),
+                        socket.gethostname(), socket.getfqdn())
+
+
+def run_command(hostname: str, *args: str) -> str:
+    assert hostname
+    return subprocess.check_output(args if is_localhost(hostname) else
+                                   ['ssh', hostname, *args],
+                                   timeout=15).decode()
+
+
+def get_facts(hostname: str, mock_p: bool, *args: str) -> Dict[str, Any]:
+    if mock_p:
+        return fabricate_facts(hostname, *args)
+    result: Dict[str, Any] = json.loads(
+        run_command(hostname, 'facter', '--json', *args))
+    return result
+
+
+def fabricate_facts(hostname: str, *args: str) -> Dict[str, Any]:
+    rng = random.randrange
+    ipaddress = '.'.join(str(n) for n in [
+        random.choice([10, 172, 192]), rng(256), rng(256), rng(256)])
+    fabricated = {
+        'processorcount': rng(1, 21),
+        'memorysize_mb': '{:.2f}'.format(random.uniform(512, 16000))
+    }
+    return dict((k, ipaddress if k.startswith('ipaddress_') else fabricated[k])
+                for k in args)
+
+
+Disk = NamedTuple('Disk', [('path', str), ('size', int), ('blksize', int)])
+Disk.size.__doc__ = 'Total size, in bytes'
+Disk.blksize.__doc__ = 'Block size for file system I/O'
+
+
+# XXX see build_disk_info() in motr's `utils/m0genfacts`
+def get_disks(hostname: str, mock_p: bool, paths: List[str]) -> List[Disk]:
+    if not paths:
+        return []
+    if mock_p:
+        return fabricate_disks(hostname, paths)
+
+    code = f"""\
+import io
+import os
+
+# os.path.getsize() and os.stat().st_size don't work well with loop devices,
+# they always return 0.
+def blockdev_size(path):
+    with open(path, 'rb') as f:
+        return f.seek(0, io.SEEK_END)
+
+print([dict(path=path,
+            size=blockdev_size(path),
+            blksize=os.stat(path).st_blksize)
+       for path in {paths!r}])
+"""
+    if not is_localhost(hostname):
+        code = f'"{code}"'
+
+    return [Disk(**kwargs) for kwargs in
+            ast.literal_eval(run_command(hostname,
+                                         'sudo', 'python3', '-c', code))]
+
+
+def fabricate_disks(hostname: str, paths: List[str]) -> List[Disk]:
+    assert paths
+    return [Disk(path=x, size=0, blksize=4096) for x in paths]
+
+
+ObjT = Enum('ObjT', 'root fdmi_flt_grp fdmi_filter'
+            ' node process service sdev'  # software subtree
+            ' site rack enclosure controller drive'  # hardware subtree
+            ' pool pver pver_f objv'  # pools subtree
+            ' profile')
+ObjT.__doc__ = 'Motr conf object type'
+
+
+def objT_to_dhall(t: ObjT) -> str:
+    return 'types.ObjT.' + ''.join(s.capitalize() for s in t.name.split('_'))
+
+
+Oid = NamedTuple('Oid', [('type', ObjT), ('fidk', int)])
+Oid.__doc__ = 'Motr conf object identifier'
+Oid.fidk.__doc__ = '.f_key part of the corresponding m0_fid'
+
+
+def oid_to_fidstr(oid: Oid) -> str:
+    """Convert Oid to string representation of fid.
+
+    >>> oid_to_fidstr(Oid(type=ObjT.process, fidk=85))
+    '0x7200000000000001:0x55'
+    """
+    assert oid.type is not ObjT.pver_f
+    fid_tcontainer = ord({
+        ObjT.root: 't', ObjT.fdmi_flt_grp: 'g', ObjT.fdmi_filter: 'l',
+        # software subtree
+        ObjT.node: 'n', ObjT.process: 'r', ObjT.service: 's', ObjT.sdev: 'd',
+        # hardware subtree
+        ObjT.site: 'S', ObjT.rack: 'a', ObjT.enclosure: 'e',
+        ObjT.controller: 'c', ObjT.drive: 'k',
+        # pools subtree
+        ObjT.pool: 'o', ObjT.pver: 'v', ObjT.objv: 'j', ObjT.profile: 'p'
+    }[oid.type])
+    return '{:#x}:{:#x}'.format(fid_tcontainer << 56 | 1, oid.fidk)
+
+
+def _infinite_counter(start: int = 0) -> Iterator[int]:
+    k = start
+    while True:
+        yield k
+        k += 1
+
+
+fidk_gen = _infinite_counter()  # fid key generator
+
+
+def new_oid(objt: ObjT) -> Oid:
+    return Oid(objt, next(fidk_gen))
+
+
+def oid_to_dhall(oid: Oid) -> str:
+    return f'utils.zoid {objT_to_dhall(oid.type)} {oid.fidk}'
+
+
+def oids_to_dhall(oids: List[Oid]) -> str:
+    if not oids:
+        return '[] : List types.Oid'
+    return '[ {} ]'.format(', '.join(oid_to_dhall(x) for x in oids))
+
+
+NetProtocol = Enum('NetProtocol', 'tcp o2ib')
+
+
+class Endpoint:
+    _tmids: Dict[Tuple[str, int], int] = {}
+
+    def __init__(self, proto: NetProtocol, ipaddr: str, portal: int,
+                 tmid: int = None):
+        self.proto = proto
+        assert ipaddr
+        self.ipaddr = ipaddr
+        assert portal > 0
+        self.portal = portal
+        if tmid is None:
+            self.tmid = self._tmids.setdefault((ipaddr, portal), 1)
+            self._tmids[(ipaddr, portal)] += 1
+        else:
+            assert tmid > 0
+            self.tmid = tmid
+
+    def __repr__(self):
+        args = ', '.join([f'proto={self.proto!r}',
+                          f'ipaddr={self.ipaddr!r}',
+                          f'portal={self.portal}',
+                          f'tmid={self.tmid}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self):
+        return f'utils.endpoint types.Protocol.{self.proto.name}' \
+            f' "{self.ipaddr}" {self.portal} {self.tmid}'
+
+    def __str__(self):
+        ip = self.ipaddr
+        proto = self.proto.name
+        return f'{ip}@{proto}:12345:{self.portal}:{self.tmid}'
+
+
+class ToDhall(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def to_dhall(self, oid: Oid) -> str:
+        pass
+
+
+Downlink = NamedTuple('Downlink', [('name', str), ('children_t', ObjT)])
+Downlink.__doc__ = 'parent -> children relation'
+
+
+class ConfRoot(ToDhall):
+    _objt = ObjT.root
+    _downlinks = {Downlink('nodes', ObjT.node),
+                  Downlink('sites', ObjT.site),
+                  Downlink('pools', ObjT.pool),
+                  Downlink('profiles', ObjT.profile)}  # XXX + fdmi_flt_grps
+
+    def __init__(self, nodes: List[Oid], sites: List[Oid], pools: List[Oid],
+                 profiles: List[Oid], mdpool: Oid = None,
+                 imeta_pver: Oid = None):
+        assert all(x.type is ObjT.node for x in nodes)
+        assert all(x.type is ObjT.site for x in sites)
+        assert all(x.type is ObjT.pool for x in pools)
+        assert all(x.type is ObjT.profile for x in profiles)
+        assert mdpool is None or mdpool.type is ObjT.pool
+        assert imeta_pver is None or imeta_pver.type is ObjT.pver
+
+        self.nodes = nodes
+        self.sites = sites
+        self.pools = pools
+        self.profiles = profiles
+        self.mdpool = mdpool
+        self.imeta_pver = imeta_pver
+
+    def __repr__(self):
+        args = ', '.join([f'nodes={self.nodes}',
+                          f'sites={self.sites}',
+                          f'pools={self.pools}',
+                          f'profiles={self.profiles}',
+                          f'mdpool={self.mdpool}',
+                          f'imeta_pver={self.imeta_pver}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.root
+        assert self.imeta_pver is not None
+        assert self.mdpool is not None
+        args = ', '.join([
+            f'id = {oid_to_dhall(oid)}',
+            f'mdpool = {oid_to_dhall(self.mdpool)}',
+            f'imeta_pver = Some ({oid_to_dhall(self.imeta_pver)})',
+            f'nodes = {oids_to_dhall(self.nodes)}',
+            f'sites = {oids_to_dhall(self.sites)}',
+            f'pools = {oids_to_dhall(self.pools)}',
+            f'profiles = {oids_to_dhall(self.profiles)}'
+        ])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any]) -> Oid:
+        root_id = new_oid(ObjT.root)
+        m0conf[root_id] = cls(nodes=[], sites=[], pools=[], profiles=[])
+        return root_id
+
+
+class ConfNode(ToDhall):
+    _objt = ObjT.node
+    _downlinks = {Downlink('processes', ObjT.process)}
+
+    def __init__(self, name: str, nr_cpu: int, memsize_MB: int,
+                 processes: List[Oid]):
+        self.name = name
+        self.nr_cpu = nr_cpu
+        self.memsize_MB = memsize_MB
+        assert all(x.type is ObjT.process for x in processes)
+        self.processes = processes
+
+    def __repr__(self):
+        args = ', '.join([f'nr_cpu={self.nr_cpu}',
+                          f'memsize_MB={self.memsize_MB}',
+                          f'processes={self.processes}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.node
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'nr_cpu = {self.nr_cpu}',
+                          f'memsize_MB = {self.memsize_MB}',
+                          f'processes = {oids_to_dhall(self.processes)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              node_desc: Dict[str, Any]) -> Oid:
+        assert parent.type is ObjT.root
+        node_id = new_oid(ObjT.node)
+        facts = node_desc['facts']
+        m0conf[node_id] = cls(name=node_desc['hostname'],
+                              nr_cpu=facts['processorcount'],
+                              memsize_MB=facts['_memsize_MB'],
+                              processes=[])
+        m0conf[parent].nodes.append(node_id)
+        return node_id
+
+
+ProcT = Enum('ProcT', 'hax m0_server m0_client_s3 m0_client_other')
+ProcT.__doc__ = 'Type of process'
+
+
+class ConfProcess(ToDhall):
+    _objt = ObjT.process
+    _downlinks = {Downlink('services', ObjT.service)}
+
+    def __init__(self, nr_cpu: int, memsize_MB: int, endpoint: Endpoint,
+                 services: List[Oid], meta_data: str = None):
+        assert nr_cpu > 0
+        self.nr_cpu = nr_cpu
+        assert memsize_MB > 0
+        self.memsize_MB = memsize_MB
+        self.endpoint = endpoint
+        self.meta_data = meta_data
+        assert all(x.type is ObjT.service for x in services)
+        self.services = services
+
+    def __repr__(self):
+        args = ', '.join([f'nr_cpu={self.nr_cpu}',
+                          f'memsize_MB={self.memsize_MB}',
+                          f'endpoint={self.endpoint!r}',
+                          f'services={self.services}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.process
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'nr_cpu = {self.nr_cpu}',
+                          f'memsize_MB = {self.memsize_MB}',
+                          f'endpoint = {self.endpoint.to_dhall()}',
+                          f'services = {oids_to_dhall(self.services)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls,
+              m0conf: Dict[Oid, Any],
+              parent: Oid,
+              node_desc: Dict[str, Any],
+              proc_t: ProcT,
+              proc_desc: Dict[str, Any] = None,
+              ctrl: Oid = None) -> Oid:
+        assert parent.type is ObjT.node
+        assert ctrl is None or ctrl.type is ObjT.controller
+
+        facts = node_desc['facts']
+        proto = node_desc.get('data_iface_type', 'tcp')
+        ep = Endpoint(proto=NetProtocol[proto],
+                      ipaddr=facts[ipaddr_key(node_desc['data_iface'])],
+                      portal=proc_t.value)
+        proc_id = new_oid(ObjT.process)
+
+        meta_data = None
+        if proc_desc is not None and proc_t is ProcT.m0_server:
+            meta_data = proc_desc['io_disks'].get('meta_data')
+
+        m0conf[proc_id] = cls(nr_cpu=facts['processorcount'],
+                              memsize_MB=facts['_memsize_MB'],
+                              endpoint=ep,
+                              meta_data=meta_data,
+                              services=[])
+        m0conf[parent].processes.append(proc_id)
+
+        for stype in service_types(proc_t, proc_desc):
+            svc_id = ConfService.build(m0conf, proc_id, stype, ep)
+            if stype is SvcT.M0_CST_IOS:  # XXX What about M0_CST_CAS?
+                assert proc_desc is not None and ctrl is not None
+                for disk in proc_desc['_io_disks']:
+                    ConfDrive.build(m0conf, ctrl,
+                                    ConfSdev.build(m0conf, svc_id, disk))
+        return proc_id
+
+
+# m0_conf_service_type
+class SvcT(Enum):
+    """Motr service type
+    """
+    M0_CST_MDS = 1
+    M0_CST_IOS = auto()
+    M0_CST_CONFD = auto()
+    M0_CST_RMS = auto()
+    M0_CST_STATS = auto()
+    M0_CST_HA = auto()
+    M0_CST_SSS = auto()
+    M0_CST_SNS_REP = auto()
+    M0_CST_SNS_REB = auto()
+    M0_CST_ADDB2 = auto()
+    M0_CST_CAS = auto()
+    M0_CST_DIX_REP = auto()
+    M0_CST_DIX_REB = auto()
+    M0_CST_DS1 = auto()
+    M0_CST_DS2 = auto()
+    M0_CST_FIS = auto()
+    M0_CST_FDMI = auto()
+    M0_CST_BE = auto()
+    M0_CST_M0T1FS = auto()
+    M0_CST_CLIENT = auto()
+    M0_CST_ISCS = auto()
+
+    def to_dhall(self) -> str:
+        return f'types.{self}'
+
+
+def service_types(proc_t: ProcT,
+                  proc_desc: Dict[str, Any] = None) -> List[SvcT]:
+    ts = []
+    if proc_t is ProcT.hax:
+        ts.append(SvcT.M0_CST_HA)
+    ts.append(SvcT.M0_CST_RMS)
+    if proc_t is ProcT.m0_server:
+        assert proc_desc is not None
+        if proc_desc.get('runs_confd'):
+            ts.append(SvcT.M0_CST_CONFD)
+        if proc_desc['_io_disks']:
+            ts.extend([SvcT.M0_CST_IOS,
+                       SvcT.M0_CST_SNS_REP,
+                       SvcT.M0_CST_SNS_REB,
+                       SvcT.M0_CST_ADDB2,
+                       SvcT.M0_CST_CAS,
+                       SvcT.M0_CST_ISCS,
+                       SvcT.M0_CST_FDMI])
+    return ts
+
+
+class ConfService(ToDhall):
+    _objt = ObjT.service
+    _downlinks = {Downlink('sdevs', ObjT.sdev)}
+
+    def __init__(self, stype: SvcT, endpoint: Endpoint, sdevs: List[Oid]):
+        self.type = stype
+        self.endpoint = endpoint
+        assert all(x.type is ObjT.sdev for x in sdevs)
+        self.sdevs = sdevs
+
+    def __repr__(self):
+        args = ', '.join([f'stype={self.type}',
+                          f'endpoint={self.endpoint!r}',
+                          f'sdevs={self.sdevs}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.service
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'type = {self.type.to_dhall()}',
+                          f'endpoint = {self.endpoint.to_dhall()}',
+                          f'sdevs = {oids_to_dhall(self.sdevs)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              stype: SvcT, endpoint: Endpoint) -> Oid:
+        assert parent.type is ObjT.process
+        svc_id = new_oid(ObjT.service)
+        m0conf[svc_id] = cls(stype, endpoint, sdevs=[])
+        m0conf[parent].services.append(svc_id)
+        return svc_id
+
+
+class ConfSdev(ToDhall):
+    _dev_idx = _infinite_counter()
+    _objt = ObjT.sdev
+    _downlinks: Set[Downlink] = set()
+
+    def __init__(self, dev_idx: int, filename: str, size: int, blksize: int):
+        assert dev_idx >= 0
+        assert filename
+        assert size >= 0
+        assert blksize >= 0
+
+        self.dev_idx = dev_idx
+        self.filename = filename
+        self.size = size
+        self.blksize = blksize
+
+    def __repr__(self):
+        args = ', '.join([f'dev_idx={self.dev_idx}',
+                          f'filename={self.filename!r}',
+                          f'size={self.size}',
+                          f'blksize={self.blksize}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.sdev
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'dev_idx = {self.dev_idx}',
+                          f'filename = "{self.filename}"',
+                          f'size = {self.size}',
+                          f'blksize = {self.blksize}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              disk_desc: Disk) -> Oid:
+        assert parent.type is ObjT.service
+        sdev_id = new_oid(ObjT.sdev)
+        m0conf[sdev_id] = cls(dev_idx=next(cls._dev_idx),
+                              filename=disk_desc.path,
+                              size=disk_desc.size,
+                              blksize=disk_desc.blksize)
+        m0conf[parent].sdevs.append(sdev_id)
+        return sdev_id
+
+
+class ConfSite(ToDhall):
+    _objt = ObjT.site
+    _downlinks = {Downlink('racks', ObjT.rack)}
+
+    def __init__(self, racks: List[Oid], pvers: List[Oid]):
+        assert all(x.type is ObjT.rack for x in racks)
+        self.racks = racks
+        assert all(x.type is ObjT.pver for x in pvers)
+        self.pvers = pvers
+
+    def __repr__(self):
+        args = ', '.join([f'racks={self.racks}',
+                          f'pvers={self.pvers}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.site
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'racks = {oids_to_dhall(self.racks)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid) -> Oid:
+        assert parent.type is ObjT.root
+        site_id = new_oid(ObjT.site)
+        m0conf[site_id] = cls(racks=[], pvers=[])
+        assert not m0conf[parent].sites
+        m0conf[parent].sites = [site_id]  # NB: a single site
+        return site_id
+
+
+class ConfRack(ToDhall):
+    _objt = ObjT.rack
+    _downlinks = {Downlink('encls', ObjT.enclosure)}
+
+    def __init__(self, encls: List[Oid], pvers: List[Oid]):
+        assert all(x.type is ObjT.enclosure for x in encls)
+        self.encls = encls
+        assert all(x.type is ObjT.pver for x in pvers)
+        self.pvers = pvers
+
+    def __repr__(self):
+        args = ', '.join([f'encls={self.encls}',
+                          f'pvers={self.pvers}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.rack
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'encls = {oids_to_dhall(self.encls)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid) -> Oid:
+        assert parent.type is ObjT.site
+        rack_id = new_oid(ObjT.rack)
+        m0conf[rack_id] = cls(encls=[], pvers=[])
+        m0conf[rack_id]._parent = parent
+        assert not m0conf[parent].racks
+        m0conf[parent].racks = [rack_id]  # NB: a single rack
+        return rack_id
+
+
+class ConfEnclosure(ToDhall):
+    _objt = ObjT.enclosure
+    _downlinks = {Downlink('ctrls', ObjT.controller)}
+
+    def __init__(self, ctrls: List[Oid], pvers: List[Oid]):
+        assert all(x.type is ObjT.controller for x in ctrls)
+        self.ctrls = ctrls
+        assert all(x.type is ObjT.pver for x in pvers)
+        self.pvers = pvers
+
+    def __repr__(self):
+        args = ', '.join([f'ctrls={self.ctrls}',
+                          f'pvers={self.pvers}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.enclosure
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'ctrls = {oids_to_dhall(self.ctrls)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid) -> Oid:
+        assert parent.type is ObjT.rack
+        encl_id = new_oid(ObjT.enclosure)
+        m0conf[encl_id] = cls(ctrls=[], pvers=[])
+        m0conf[encl_id]._parent = parent
+        m0conf[parent].encls.append(encl_id)
+        return encl_id
+
+
+class ConfController(ToDhall):
+    _objt = ObjT.controller
+    _downlinks = {Downlink('drives', ObjT.drive)}
+
+    def __init__(self, node: Oid, drives: List[Oid], pvers: List[Oid]):
+        assert node.type is ObjT.node
+        self.node = node
+        assert all(x.type is ObjT.drive for x in drives)
+        self.drives = drives
+        assert all(x.type is ObjT.pver for x in pvers)
+        self.pvers = pvers
+
+    def __repr__(self):
+        args = ', '.join([f'node={self.node}',
+                          f'drives={self.drives}',
+                          f'pvers={self.pvers}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.controller
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'node = {oid_to_dhall(self.node)}',
+                          f'drives = {oids_to_dhall(self.drives)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid, node: Oid) -> Oid:
+        assert parent.type is ObjT.enclosure
+        assert node.type is ObjT.node
+
+        ctrl_id = new_oid(ObjT.controller)
+        m0conf[ctrl_id] = cls(node, drives=[], pvers=[])
+        m0conf[ctrl_id]._parent = parent
+        m0conf[parent].ctrls.append(ctrl_id)
+        return ctrl_id
+
+
+class ConfDrive(ToDhall):
+    _objt = ObjT.drive
+    _downlinks: Set[Downlink] = set()
+
+    def __init__(self, sdev: Oid, pvers: List[Oid]):
+        assert sdev.type is ObjT.sdev
+        self.sdev = sdev
+        assert all(x.type is ObjT.pver for x in pvers)
+        self.pvers = pvers
+
+    def __repr__(self):
+        args = ', '.join([f'sdev={self.sdev}',
+                          f'pvers={self.pvers}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.drive
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'sdev = {oid_to_dhall(self.sdev)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid, sdev: Oid) -> Oid:
+        assert parent.type is ObjT.controller
+        assert sdev.type is ObjT.sdev
+
+        drive_id = new_oid(ObjT.drive)
+        m0conf[drive_id] = cls(sdev, pvers=[])
+        m0conf[drive_id]._parent = parent
+        m0conf[parent].drives.append(drive_id)
+        return drive_id
+
+
+PoolT = Enum('PoolT', 'sns dix md')  # PoolType.dhall
+
+
+def pool_type(pool_desc: Dict[str, Any]) -> PoolT:
+    return PoolT[pool_desc.get('type', 'sns')]
+
+
+def pool_drives(m0conf: Dict[Oid, Any],
+                pool_desc: Dict[str, Any]) -> List[Oid]:
+    ptype = pool_type(pool_desc)
+    assert 'disk_refs' not in pool_desc or ptype is PoolT.sns
+
+    if ptype is PoolT.dix:
+        cas = [(svc_id, ctrl_id)
+               for ctrl_id in m0conf if ctrl_id.type is ObjT.controller
+               for proc_id in m0conf[m0conf[ctrl_id].node].processes
+               for svc_id in m0conf[proc_id].services
+               if m0conf[svc_id].type is SvcT.M0_CST_CAS]
+        return [ConfDrive.build(m0conf, ctrl_id,
+                                ConfSdev.build(m0conf, svc_id,
+                                               Disk(path='/dev/null',
+                                                    size=1024,
+                                                    blksize=1)))
+                for (svc_id, ctrl_id) in cas]
+
+    if ptype is PoolT.md:
+        return [m0conf[ctrl_id].drives[0]
+                for ctrl_id in m0conf if ctrl_id.type is ObjT.controller]
+
+    assert ptype is PoolT.sns
+    all_drives: List[Tuple[Oid, Oid]] = [
+        (drive_id, m0conf[ctrl_id].node)
+        for ctrl_id in m0conf if ctrl_id.type is ObjT.controller
+        for drive_id in m0conf[ctrl_id].drives
+    ]
+    assert all_drives
+    assert all(drive_id.type is ObjT.drive and node_id.type is ObjT.node
+               for drive_id, node_id in all_drives)
+
+    disk_refs = pool_desc.get('disk_refs')
+    if disk_refs is None:
+        drives = all_drives
+    else:
+        assert disk_refs
+        drives = []
+        for ref in disk_refs:
+            targets = [(drive_id, node_id)
+                       for drive_id, node_id in all_drives
+                       if ref['path'] == m0conf[m0conf[drive_id].sdev].filename
+                       and ref.get('node') in (None, m0conf[node_id].name)]
+            assert len(targets) == 1  # guaranteed by validate_pools_desc()
+            drives.extend(targets)
+        assert all_unique(drives), \
+            'Pool {!r}: some of disk_refs refer to the same disk'.format(
+                pool_desc['name'])
+
+    over_referenced: Dict[Oid, List[Oid]] = {}  # node-to-drives mapping
+    for drive_id, node_id in drives:
+        if m0conf[drive_id].pvers:  # already assigned to some pool
+            over_referenced.setdefault(node_id, []).append(drive_id)
+    if over_referenced:
+        err = '{} referred to by several pools:'.format(
+            'This disk is' if len(over_referenced) == 1 else 'These disks are')
+        for node_id in sorted(over_referenced):
+            err += '\n  ' + m0conf[node_id].name
+            for drive_id in sorted(over_referenced[node_id]):
+                err += '\n   \\_ ' + m0conf[m0conf[drive_id].sdev].filename
+        raise AssertionError(err)
+
+    return [drive_id for drive_id, _ in drives]
+
+
+Failures = NamedTuple('Failures', [('site', int),
+                                   ('rack', int),
+                                   ('enclosure', int),
+                                   ('controller', int),
+                                   ('drive', int)])
+Failures.__doc__ = """\
+Failure tolerance vector.
+
+For a given pool version, the failure tolerance vector reflects how
+many devices in each level can be expected to fail whilst still
+allowing the remaining disks in that pool version to be read.
+
+For disks, then, note that this will equal the parameter K, where
+(N,K,P) is the triple of data units, parity units, pool width for
+the pool version.
+
+For controllers, this should indicate the maximum number such that
+no failure of that number of controllers can take out more than K
+units.  We can put an upper bound on this by considering
+floor((nr_encls)/(N+K)), though distributional issues may result
+in a lower value.
+"""
+pver_levels = Failures._fields
+
+
+class ConfPool(ToDhall):
+    _objt = ObjT.pool
+    _downlinks = {Downlink('pvers', ObjT.pver)}
+
+    def __init__(self, pvers: List[Oid], name: Optional[str]):
+        assert all(x.type in (ObjT.pver, ObjT.pver_f) for x in pvers)
+        self.pvers = pvers
+        self._name = name
+
+    def __repr__(self):
+        args = ', '.join([f'pvers={self.pvers}',
+                          f'name={self._name!r}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.pool
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'pvers = {oids_to_dhall(self.pvers)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              pool_desc: Dict[str, Any]) -> Oid:
+        assert parent.type is ObjT.root
+
+        pool_id = new_oid(ObjT.pool)
+        m0conf[pool_id] = cls(pvers=[], name=pool_desc.get('name'))
+        m0conf[parent].pools.append(pool_id)
+
+        drives = pool_drives(m0conf, pool_desc)
+        t = pool_type(pool_desc)
+        assert ('data_units' in pool_desc) == ('parity_units' in pool_desc)
+        if 'data_units' in pool_desc:
+            pd_attrs = PDClustAttrs0(pool_desc['data_units'],
+                                     pool_desc['parity_units'])
+        else:
+            if t is PoolT.dix:
+                # For CAS service N must be equal to 1.  CAS records are
+                # indivisible pieces of data, the whole CAS record is
+                # always stored on one node.
+                data_units = 1
+            else:
+                assert t is PoolT.md
+                data_units = len(drives)
+            pd_attrs = PDClustAttrs0(data_units=data_units, parity_units=0)
+        tolerance = None if t is PoolT.sns else Failures(0, 0, 0, 1, 0)
+        pver = ConfPver.build(m0conf, pool_id, pd_attrs, drives, tolerance)
+        if t is PoolT.dix:
+            assert m0conf[parent].imeta_pver is None
+            m0conf[parent].imeta_pver = pver
+        elif t is PoolT.md:
+            assert m0conf[parent].mdpool is None
+            m0conf[parent].mdpool = pool_id
+        else:
+            assert t is PoolT.sns
+            d = pool_desc.get('allowed_failures')
+            for v in gen_allowances(Failures(0, 0, 0, 0, 0) if d is None else
+                                    Failures(d['site'],
+                                             d['rack'],
+                                             d['encl'],
+                                             d['ctrl'],
+                                             d['disk'])):
+                ConfPverF.build(m0conf, pool_id, base=pver, allowance=v)
+
+        return pool_id
+
+
+def gen_allowances(allowed: Failures) -> List[Failures]:
+    """Generate all combinations of failures from CDF's `allowed_failures`
+    vector.
+
+    >>> gen_allowances(Failures(0, 0, 0, 0, 2))
+    [Failures(0, 0, 0, 0, 1), Failures(0, 0, 0, 0, 2)]
+    >>> gen_allowances(Failures(0, 0, 0, 1, 2))
+    [Failures(0, 0, 0, 0, 1),
+     Failures(0, 0, 0, 0, 2),
+     Failures(0, 0, 0, 1, 0),
+     Failures(0, 0, 0, 1, 1),
+     Failures(0, 0, 0, 1, 2)]
+    >>> gen_allowances(Failures(0, 0, 0, 0, 0))
+    []
+    """
+    return [Failures(*v) for v in
+            filter(any, itertools.product(*(range(n+1) for n in allowed)))]
+
+
+# m0_pdclust_attr
+PDClustAttrs0 = NamedTuple('PDClustAttrs0',
+                           # XXX What about `unit_size` and `seed`?
+                           [('data_units', int), ('parity_units', int)])
+PDClustAttrs0.__doc__ = 'Motr parity de-clustering layout attributes'
+
+
+def tolerated_failures(m0conf: Dict[Oid, Any], pd_attrs: PDClustAttrs0,
+                       drives: List[Oid]) -> Failures:
+    assert pd_attrs.data_units > 0
+    assert pd_attrs.parity_units >= 0
+    assert drives and all(x.type is ObjT.drive for x in drives)
+    assert all_unique(drives)
+
+    n, k = pd_attrs
+
+    nr_ctrls = 0
+    for ctrl_id, ctrl in m0conf.items():
+        if ctrl_id.type is not ObjT.controller:
+            continue
+        if not set(m0conf[ctrl_id].drives).isdisjoint(set(drives)):
+            nr_ctrls += 1
+    assert nr_ctrls > 0
+
+    q, r = divmod(n + 2*k, nr_ctrls)
+    # There are `r` controllers with `q+1` units and
+    # `(nr_ctrls - r)` controllers with `q` units.
+    #
+    # In the worst scenario the most populated controllers
+    # will go down first.
+    #
+    # `kc` is the number of parity group units that will be
+    # unavailable when those `r` controllers go down.
+    kc = r * (q + 1)
+    if kc > k:
+        # We won't be able to recover data if `kc` units are lost.
+        # Recalculate the tolerable number of controller failures
+        # by distributing the tolerable number of unit failures
+        # (`k`) among the "most populous" controllers (`q+1` units
+        # in each).
+        ctrl_failures = k // (q + 1)
+    elif kc < k:
+        # `kc` units (`r` controllers) are lost, but we can
+        # tolerate losing `k - kc` more units.
+        # `(k - kc) // q` is the number of additional controller
+        # failures that we can tolerate.
+        ctrl_failures = r + (k - kc) // q
+    else:
+        # kc == k.  We can lose precisely `r` controllers;
+        # no more, no less.
+        ctrl_failures = r
+    return Failures(site=0, rack=0, enclosure=0, controller=ctrl_failures,
+                    drive=k)
+
+
+class ConfPver(ToDhall):
+    _objt = ObjT.pver
+    _downlinks = {Downlink('sitevs', ObjT.objv)}
+
+    def __init__(self, data_units: int, parity_units: int, pool_width: int,
+                 tolerance: List[int], sitevs: List[Oid]):
+        assert data_units > 0
+        assert parity_units >= 0
+        assert pool_width > 0
+        assert len(tolerance) == len(pver_levels)
+        assert all(n >= 0 for n in tolerance)
+        assert all(x.type is ObjT.objv for x in sitevs)
+
+        self.data_units = data_units
+        self.parity_units = parity_units
+        self.pool_width = pool_width
+        self.tolerance = tolerance
+        self.sitevs = sitevs
+
+    def __repr__(self):
+        args = ', '.join([f'data_units={self.data_units}',
+                          f'parity_units={self.parity_units}',
+                          f'pool_width={self.pool_width}',
+                          f'tolerance={self.tolerance}',
+                          f'sitevs={self.sitevs}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.pver
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'data_units = {self.data_units}',
+                          f'parity_units = {self.parity_units}',
+                          f'pool_width = {self.pool_width}',
+                          f'tolerance = {self.tolerance}',
+                          f'sitevs = {oids_to_dhall(self.sitevs)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              pd_attrs: PDClustAttrs0, drives: List[Oid],
+              tolerance: Failures = None) -> Oid:
+        assert parent.type is ObjT.pool
+        assert drives and all(x.type is ObjT.drive for x in drives)
+        assert all_unique(drives)
+
+        pver_id = new_oid(ObjT.pver)  # "base" pool version
+        m0conf[pver_id] = cls(
+            data_units=pd_attrs.data_units,
+            parity_units=pd_attrs.parity_units,
+            pool_width=len(drives),
+            tolerance=list(tolerated_failures(m0conf, pd_attrs, drives)
+                           if tolerance is None else tolerance),
+            sitevs=[])
+        m0conf[parent].pvers.append(pver_id)
+        build_pver_subtree(m0conf, pver_id, drives)
+        return pver_id
+
+
+class ConfPverF(ToDhall):
+    _cuid = _infinite_counter()  # cluster-unique pver_f identifier
+    _objt = ObjT.pver_f
+    _downlinks: Set[Downlink] = set()
+
+    def __init__(self, cuid: int, base: Oid, allowance: List[int]):
+        assert cuid >= 0
+        assert base.type is ObjT.pver
+        assert len(allowance) == len(pver_levels)
+        all(n >= 0 for n in allowance)
+
+        self.cuid = cuid
+        self.base = base
+        self.allowance = allowance
+
+    def __repr__(self):
+        args = ', '.join([f'cuid={self.cuid}',
+                          f'base={self.base}',
+                          f'allowance={self.allowance}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.pver_f
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'cuid = {self.cuid}',
+                          f'base = {oid_to_dhall(self.base)}',
+                          f'allowance = {self.allowance}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              base: Oid, allowance: Failures) -> Oid:
+        assert parent.type is ObjT.pool
+
+        pver_id = new_oid(ObjT.pver_f)
+        m0conf[pver_id] = cls(cuid=next(cls._cuid),
+                              base=base,
+                              allowance=list(allowance))
+        m0conf[parent].pvers.append(pver_id)
+        return pver_id
+
+
+def build_pver_subtree(m0conf: Dict[Oid, Any], pver: Oid,
+                       drives: List[Oid]) -> None:
+    assert pver.type is ObjT.pver
+    assert drives and all(x.type is ObjT.drive for x in drives)
+
+    # Maps real object to the corresponding virtual object.
+    virtual: Dict[Oid, Oid] = {}
+
+    for drive in drives:
+        assert drive not in virtual
+        assert pver not in m0conf[drive].pvers
+        m0conf[drive].pvers.append(pver)
+        virtual[drive] = ConfObjv.build(m0conf, real=drive)
+
+        devs = [drive]
+        parent_types = [getattr(ObjT, x) for x in pver_levels[:-1]]
+        while parent_types:
+            devs.insert(0, m0conf[devs[0]]._parent)
+            dev = devs[0]
+            assert dev.type is parent_types.pop()
+            parent_ready = dev in virtual
+            if not parent_ready:
+                assert pver not in m0conf[dev].pvers
+                m0conf[dev].pvers.append(pver)
+                virtual[dev] = ConfObjv.build(m0conf, real=dev)
+            m0conf[virtual[dev]].children.append(virtual[devs[1]])
+            if parent_ready:
+                break
+
+        if not parent_types:
+            m0conf[pver].sitevs.append(virtual[devs[0]])
+
+
+class ConfObjv(ToDhall):
+    _objt = ObjT.objv
+    _downlinks = {Downlink('children', ObjT.objv)}
+
+    def __init__(self, real: Oid, children: List[Oid]):
+        assert real.type in [getattr(ObjT, x) for x in pver_levels]
+        self.real = real
+        assert all(x.type is ObjT.objv for x in children)
+        self.children = children
+
+    def __repr__(self):
+        args = ', '.join([f'real={self.real}',
+                          f'children={self.children}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.objv
+        args = ', '.join([f'id={oid_to_dhall(oid)}',
+                          f'real={oid_to_dhall(self.real)}',
+                          f'children={oids_to_dhall(self.children)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], real: Oid) -> Oid:
+        assert real in m0conf
+        objv_id = new_oid(ObjT.objv)
+        m0conf[objv_id] = cls(real, [])
+        return objv_id
+
+
+class ConfProfile(ToDhall):
+    _objt = ObjT.profile
+    _downlinks: Set[Downlink] = set()
+
+    def __init__(self, pools: List[Oid], name: str):
+        assert all(x.type is ObjT.pool for x in pools)
+        self.pools = pools
+        self._name = name
+
+    def __repr__(self):
+        args = ', '.join([f'pools={self.pools}',
+                          f'name={self._name!r}'])
+        return f'{self.__class__.__name__}({args})'
+
+    def to_dhall(self, oid: Oid) -> str:
+        assert oid.type is ObjT.profile
+        args = ', '.join([f'id = {oid_to_dhall(oid)}',
+                          f'pools = {oids_to_dhall(self.pools)}'])
+        return '{ %s }' % args
+
+    @classmethod
+    def build(cls, m0conf: Dict[Oid, Any], parent: Oid,
+              prof_desc: Dict[str, Any]) -> Oid:
+        assert parent.type is ObjT.root
+
+        pool_ids = dict((m0conf[pool_id]._name, pool_id) for pool_id in m0conf
+                        if pool_id.type is ObjT.pool
+                        and m0conf[pool_id]._name in prof_desc['pools'])
+        prof_pools = [pool_ids[pool] for pool in prof_desc['pools']]
+
+        root = m0conf[parent]
+        dix_pools = [pool for pool in root.pools
+                     if root.imeta_pver in m0conf[pool].pvers]
+        assert len(dix_pools) == 1
+        dix_pool = dix_pools[0]
+        if dix_pool not in prof_pools:
+            prof_pools.append(dix_pool)
+
+        assert root.mdpool is not None
+        if root.mdpool not in prof_pools:
+            prof_pools.append(root.mdpool)
+
+        prof_id = new_oid(ObjT.profile)
+        m0conf[prof_id] = cls(pools=prof_pools, name=prof_desc['name'])
+        m0conf[parent].profiles.append(prof_id)
+        return prof_id
+
+
+ConsulAgent = NamedTuple('ConsulAgent', [('node_name', str), ('ipaddr', str)])
+
+Cluster = NamedTuple('Cluster', [('m0conf', Dict[Oid, Any]),
+                                 ('consul_servers', List[ConsulAgent]),
+                                 ('consul_clients', List[ConsulAgent]),
+                                 ('m0_clients', Dict[Oid, Oid])])
+
+
+def generate_consul_agents(cluster: Cluster) -> str:
+    assert cluster.consul_servers
+    return json.dumps(
+        {'servers': [x._asdict() for x in cluster.consul_servers],
+         'clients': [x._asdict() for x in cluster.consul_clients]},
+        indent=2) + '\n'
+
+
+def consul_kv_drives(m0conf: Dict[Oid, Any]) -> Dict[str, str]:
+    state_unknown = json.dumps({'state': 'M0_NC_UNKNOWN'})
+    d = {}
+    for site_id, site in m0conf.items():
+        if site_id.type is not ObjT.site:
+            continue
+        site_key = 'm0conf/sites/' + oid_to_fidstr(site_id)
+        d[site_key] = state_unknown
+        for rack_id in site.racks:
+            assert rack_id.type is ObjT.rack
+            rack_key = f'{site_key}/racks/' + oid_to_fidstr(rack_id)
+            d[rack_key] = state_unknown
+            for encl_id in m0conf[rack_id].encls:
+                assert encl_id.type is ObjT.enclosure
+                encl_key = f'{rack_key}/encls/' + oid_to_fidstr(encl_id)
+                d[encl_key] = state_unknown
+                for ctrl_id in m0conf[encl_id].ctrls:
+                    assert ctrl_id.type is ObjT.controller
+                    ctrl_key = f'{encl_key}/ctrls/' + \
+                        oid_to_fidstr(ctrl_id)
+                    d[ctrl_key] = json.dumps(
+                        {'node': oid_to_fidstr(m0conf[ctrl_id].node),
+                         'state': 'M0_NC_UNKNOWN'})
+                    for drive_id in m0conf[ctrl_id].drives:
+                        assert drive_id.type is ObjT.drive
+                        drive_key = f'{ctrl_key}/drives/' + \
+                            oid_to_fidstr(drive_id)
+                        d[drive_key] = json.dumps(
+                            {'sdev': oid_to_fidstr(m0conf[drive_id].sdev),
+                             'state': 'M0_NC_UNKNOWN'})
+    return d
+
+
+def consul_kv_sdevs(m0conf: Dict[Oid, Any]) -> Dict[str, str]:
+    d = {}
+    for node_id, node in m0conf.items():
+        if node_id.type is not ObjT.node:
+            continue
+        node_key = 'm0conf/nodes/' + oid_to_fidstr(node_id)
+        d[node_key] = json.dumps({'name': node.name,
+                                  'state': 'M0_NC_UNKNOWN'})
+        for proc_id in node.processes:
+            assert proc_id.type is ObjT.process
+            proc_key = f'{node_key}/processes/' + oid_to_fidstr(proc_id)
+            # XXX-VERIFYME Can we really convert from portal (int) to name?
+            proc_name = ProcT(m0conf[proc_id].endpoint.portal).name
+            d[proc_key] = json.dumps({'name': proc_name,
+                                      'state': 'M0_NC_UNKNOWN'})
+            for svc_id in m0conf[proc_id].services:
+                assert svc_id.type is ObjT.service
+                svc_key = f'{proc_key}/services/' + oid_to_fidstr(svc_id)
+                stype = m0conf[svc_id].type.name[len('M0_CST_'):].lower()
+                d[svc_key] = json.dumps({'name': stype,
+                                         'state': 'M0_NC_UNKNOWN'})
+                for sdev_id in m0conf[svc_id].sdevs:
+                    assert sdev_id.type is ObjT.sdev
+                    sdev_key = f'{svc_key}/sdevs/' + oid_to_fidstr(sdev_id)
+                    d[sdev_key] = json.dumps(
+                        {'path': m0conf[sdev_id].filename,
+                         'state': 'M0_NC_UNKNOWN'})
+    return d
+
+
+def generate_consul_kv(cluster: Cluster, dhall_dir: str) -> str:
+    assert os.path.isabs(dhall_dir)  # XXX DELETEME
+    assert all(k.type is ObjT.process and v.type is ObjT.service
+               for k, v in cluster.m0_clients.items())
+
+    global fidk_gen
+    _fidk_gen = next(fidk_gen)
+    # Give up ownership of `fidk_gen`, passing it to the Consul KV.
+    del fidk_gen
+
+    m0conf = cluster.m0conf
+
+    ConsulService = NamedTuple('ConsulService', [
+        ('node_name', str), ('proc_id', Oid), ('ep', Endpoint),
+        ('svc_id', Oid), ('stype', str), ('meta_data', Optional[str])])
+
+    def processes() -> Iterator[ConsulService]:
+        for node_id, node in m0conf.items():
+            if node_id.type is not ObjT.node:
+                continue
+            for proc_id in node.processes:
+                assert proc_id.type is ObjT.process
+                for svc_id in m0conf[proc_id].services:
+                    stype = m0conf[svc_id].type.name[len('M0_CST_'):].lower()
+                    proc = m0conf[proc_id]
+                    yield ConsulService(node_name=node.name,
+                                        proc_id=proc_id,
+                                        ep=proc.endpoint,
+                                        svc_id=svc_id,
+                                        stype=stype,
+                                        meta_data=proc.meta_data)
+                # Add Motr clients to consul kv
+                if proc_id in cluster.m0_clients:
+                    proc_ep = m0conf[proc_id].endpoint
+                    yield ConsulService(node_name=node.name,
+                                        proc_id=proc_id,
+                                        ep=proc.endpoint,
+                                        svc_id=cluster.m0_clients[proc_id],
+                                        stype=ProcT(proc_ep.portal).name,
+                                        meta_data=None)
+
+    def sns_pools() -> List[Oid]:
+        for root_id, root in m0conf.items():
+            if root_id.type is ObjT.root:
+                return [x for x in root.pools
+                        if x != root.mdpool and
+                        root.imeta_pver not in m0conf[x].pvers]
+        raise RuntimeError('Impossible happened')
+
+    return json.dumps([dict(key=k, value=v) for k, v in (
+        ('epoch', 1),
+        ('eq-epoch', 1),
+        ('leader', ''),
+        ('last_fidk', _fidk_gen),
+        *[('m0conf/pools/' + oid_to_fidstr(pool_id), m0conf[pool_id]._name)
+          for pool_id in sns_pools()],
+        *[('m0conf/profiles/' + oid_to_fidstr(prof_id),
+           json.dumps({
+               'name': prof._name,
+               'pools': [m0conf[pool_id]._name for pool_id in prof.pools]
+           }))
+          for prof_id, prof in m0conf.items() if prof_id.type is ObjT.profile],
+        *[(f'm0conf/nodes/{x.node_name}/processes/{x.proc_id.fidk}/services/'
+           f'{x.stype}', x.svc_id.fidk) for x in processes()],
+        *[(f'm0conf/nodes/{x.node_name}/processes/{x.proc_id.fidk}/'
+           f'meta_data', x.meta_data)
+          for x in processes() if x.stype == 'ios' and x.meta_data],
+        *[(f'm0conf/nodes/{x.node_name}/processes/{x.proc_id.fidk}/endpoint',
+           str(x.ep))
+          for x in processes()],
+        *consul_kv_sdevs(m0conf).items(),
+        *consul_kv_drives(m0conf).items())],
+                      indent=2) + '\n'
+
+
+def generate_confd(m0conf: Dict[Oid, ToDhall], dhall_dir: str) -> str:
+    assert os.path.isabs(dhall_dir)
+
+    def objt(obj: ToDhall) -> str:
+        objt = obj.__class__.__name__
+        assert objt.startswith('Conf')
+        return objt[len('Conf'):]
+
+    objs = '\n  , '.join('types.Obj.{} {}'.format(objt(v), v.to_dhall(k))
+                         for k, v in m0conf.items())
+    return f"""\
+let types = {dhall_dir}/types.dhall
+let utils = {dhall_dir}/utils.dhall
+
+let objs =
+  [ {objs}
+  ]
+
+in {dhall_dir}/toConfGen.dhall objs
+"""
+
+
+def validate_m0conf(m0conf: Dict[Oid, Any]) -> None:
+    children_by_parent_type: Dict[ObjT, Dict[Downlink, List[Oid]]] = \
+        dict((parent_t, {}) for parent_t in ObjT)
+    for oid, obj in m0conf.items():
+        assert oid.type is obj._objt
+        assert obj.__class__.__name__ == \
+            'Conf' + ''.join(s.capitalize() for s in oid.type.name.split('_'))
+        for rel in obj._downlinks:
+            children = getattr(obj, rel.name)
+            assert all_unique(children)
+            assert all(
+                (x.type is rel.children_t or
+                 # XXX leaky abstraction
+                 (x.type is ObjT.pver_f and rel.children_t is ObjT.pver))
+                for x in children)
+            children_by_parent_type[oid.type].setdefault(rel.name, []) \
+                                             .extend(children)
+    assert all(all_unique(children)
+               for _parent_t, rel_children in children_by_parent_type.items()
+               for _rel, children in rel_children.items())
+
+
+def build_cluster(cluster_desc: Dict[str, Any]) -> Cluster:
+    cluster = Cluster(m0conf={}, consul_servers=[], consul_clients=[],
+                      m0_clients={})
+    conf = cluster.m0conf
+    root_id = ConfRoot.build(conf)
+    # XXX Move all the logic into ConfRoot.build?
+
+    rack_id = ConfRack.build(conf, ConfSite.build(conf, root_id))
+
+    for node in cluster_desc['nodes']:
+        node_id = ConfNode.build(conf, root_id, node)
+        ctrl_id = None
+        m0ds = node.get('m0_servers', [])
+        if any(m0d['_io_disks'] for m0d in m0ds):
+            ctrl_id = ConfController.build(conf,
+                                           ConfEnclosure.build(conf, rack_id),
+                                           node_id)
+
+        ConfProcess.build(conf, node_id, node, ProcT.hax)
+
+        confd_p = False
+        for m0d in m0ds:
+            ConfProcess.build(conf, node_id, node, ProcT.m0_server, m0d,
+                              ctrl_id)
+            if m0d['runs_confd']:
+                confd_p = True
+
+        ipaddr = node['facts'][ipaddr_key(node['data_iface'])]
+        (cluster.consul_servers if confd_p else cluster.consul_clients).\
+            append(ConsulAgent(node_name=node['hostname'],
+                               # XXX use 'mgmt_iface' for consul?
+                               ipaddr=ipaddr))
+
+        for client_t, proc_t in [('s3', ProcT.m0_client_s3),
+                                 ('other', ProcT.m0_client_other)]:
+            for _ in range(node['m0_clients'][client_t]):
+                proc_id = ConfProcess.build(conf, node_id, node, proc_t)
+                cluster.m0_clients[proc_id] = new_oid(ObjT.service)
+
+    for pool in cluster_desc['pools']:
+        ConfPool.build(conf, root_id, pool)
+
+    if conf[root_id].imeta_pver is None:  # no DIX pool defined in the CDF
+        ConfPool.build(conf, root_id, {'type': 'dix'})
+
+    if conf[root_id].mdpool is None:  # no Metadata pool defined in the CDF
+        ConfPool.build(conf, root_id, {'type': 'md'})
+
+    for prof in cluster_desc['profiles']:
+        ConfProfile.build(conf, root_id, prof)
+
+    validate_m0conf(conf)
+    assert cluster.consul_servers
+    names = [x.node_name
+             for x in cluster.consul_servers + cluster.consul_clients]
+    assert all_unique(names)
+    assert all(re.search('[",= @]', name) is None for name in names)
+    assert all_unique(x.ipaddr
+                      for x in cluster.consul_servers + cluster.consul_clients)
+    return cluster
+
+
+if __name__ == '__main__':
+    main()
